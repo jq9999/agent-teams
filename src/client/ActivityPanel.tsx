@@ -23,7 +23,7 @@ import {
 } from 'react'
 import {
   IconBranchOutline16, IconChevronDownOutline14, IconPanelLeftOutline16,
-  IconStopFill16, IconWarningOutline16,
+  IconStopFill16, IconTrashOutline16, IconWarningOutline16,
 } from './icons.tsx'
 import { Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import { currentSessionId } from './session-navigation.ts'
@@ -96,6 +96,8 @@ const PANEL_SHIFT_PROPERTY = '--agent-teams-panel-shift'
 const PANEL_CONVERSATION_GAP = 14
 const MOVE_THRESHOLD = 4
 const CAPTAIN_ASSIGNEE = 'captain'
+/** Host route the plan editor and the delete-team action post control mutations to. */
+const ACTIVITY_PLAN_URL = '/plugins/dsh-agent-teams/plan'
 
 type PanelGesture = {
   readonly kind: 'move' | 'resize'
@@ -557,6 +559,9 @@ export function TeamSection({ team, modelDirectory, onContinuePlanning, onDiscar
   const [stopOpen, setStopOpen] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [stopError, setStopError] = useState('')
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
   const discarded = historic && team.phase === 'staged'
   const stopped = !historic && team.halted === true
   const busyCount = team.members.filter((member) => member.activity === 'working').length
@@ -574,6 +579,7 @@ export function TeamSection({ team, modelDirectory, onContinuePlanning, onDiscar
     task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled'
   )).length
   const canStop = !historic && team.phase === 'running' && team.halted !== true && teamIsActive(team)
+  const canDelete = !historic
   const stopTeam = async (): Promise<void> => {
     if (stopping) return
     setStopping(true)
@@ -600,6 +606,32 @@ export function TeamSection({ team, modelDirectory, onContinuePlanning, onDiscar
       setStopping(false)
     }
   }
+  const deleteTeam = async (): Promise<void> => {
+    if (deleting) return
+    setDeleting(true)
+    setDeleteError('')
+    try {
+      const response = await fetch(ACTIVITY_PLAN_URL, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: team.captainSessionId, teamId: team.teamId, action: 'delete_team' }),
+      })
+      if (!response.ok) {
+        let message = t('team.deleteRequestFailed')
+        try {
+          const body = await response.json() as { error?: unknown }
+          if (typeof body.error === 'string' && body.error.trim() !== '') message = body.error
+        } catch {}
+        throw new Error(message)
+      }
+      setDeleteOpen(false)
+    } catch (error: unknown) {
+      setDeleteError(t('team.deleteFailed', { message: error instanceof Error ? error.message : String(error) }))
+    } finally {
+      setDeleting(false)
+    }
+  }
   return (
     <>
       <section className={css.team} data-team-id={team.teamId} data-workspace-team={workspace || undefined}>
@@ -621,6 +653,18 @@ export function TeamSection({ team, modelDirectory, onContinuePlanning, onDiscar
               onClick={() => { setStopError(''); setStopOpen(true) }}
             >
               <IconStopFill16 />
+            </button>
+          )}
+          {canDelete && (
+            <button
+              type="button"
+              className={css.teamStopButton}
+              data-delete-team
+              aria-label={t('team.delete')}
+              title={t('team.delete')}
+              onClick={() => { setDeleteError(''); setDeleteOpen(true) }}
+            >
+              <IconTrashOutline16 />
             </button>
           )}
         </header>
@@ -817,6 +861,24 @@ export function TeamSection({ team, modelDirectory, onContinuePlanning, onDiscar
         )}
       >
         {stopError !== '' && <p className={css.stopModalError} role="alert"><IconWarningOutline16 />{stopError}</p>}
+      </Modal>
+      <Modal
+        open={deleteOpen}
+        onClose={() => { if (!deleting) setDeleteOpen(false) }}
+        title={t('team.deleteTitle', { team: team.name })}
+        closeLabel={t('plan.cancel')}
+        description={t('team.deleteDescription')}
+        footer={(
+          <span className={css.stopModalActions}>
+            <button type="button" disabled={deleting} onClick={() => { setDeleteOpen(false) }}>{t('team.deleteCancel')}</button>
+            <button type="button" data-danger disabled={deleting} onClick={() => { void deleteTeam() }}>
+              <IconTrashOutline16 />
+              {deleting ? t('team.deleting') : t('team.deleteConfirm')}
+            </button>
+          </span>
+        )}
+      >
+        {deleteError !== '' && <p className={css.stopModalError} role="alert"><IconWarningOutline16 />{deleteError}</p>}
       </Modal>
     </>
   )

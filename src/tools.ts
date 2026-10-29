@@ -156,6 +156,7 @@ export interface AgentTeamsRuntime {
   approveStagedTeam(captain: Agent, teamId: string, signal?: AbortSignal): Promise<{ teamId: string; members: number; tasks: number }>
   continueStagedPlanning(captain: Agent, teamId: string): Promise<{ teamId: string; alreadyWaiting: boolean }>
   discardStagedTeam(captain: Agent, teamId: string): Promise<{ teamId: string }>
+  deleteTeam(captain: Agent, teamId: string, signal?: AbortSignal): Promise<{ deleted: true; team_name: string }>
 }
 
 /** The caller agent, or a loud failure for non-agent callers. */
@@ -936,7 +937,45 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
     return { teamId: discarded.teamId }
   }
 
-
+  /**
+   * End and archive a team by id on behalf of its captain. Shared by the
+   * agent_teams_delete tool and the Web "delete_team" plan action so both
+   * paths retire every member, drain their pending mail, then archive (never
+   * hard-delete) the tasks and mailboxes for later review.
+   */
+  const deleteTeam: AgentTeamsRuntime['deleteTeam'] = async (captain, teamId, signal) => {
+    const workspace = workspaceOf(captain)
+    const stateRoot = stateRootOf(workspace, config)
+    const roster = await withTeamLock(teamLockKey(stateRoot, teamId), async () => {
+      const fresh = await requireFreshCaptainTeam(ctx, stateRoot, teamId, captain.id)
+      // Include previously removed members so deleting a pre-fix team also
+      // retires durable catalog entries left behind by remove_member.
+      const members = fresh.members.map(member => ({ ...member }))
+      for (const member of fresh.members) {
+        await discardMailboxMessages(stateRoot, fresh.id, member.name, (await readUnreadMailbox(stateRoot, fresh.id, member.name)).map(message => message.id))
+        if (member.status === 'removed') continue
+        member.status = 'removed'
+        for (const task of fresh.tasks) {
+          if (task.assignee === member.name && !TERMINAL_TASK_STATUSES.includes(task.status)) invalidateTaskAttempt(task)
+        }
+      }
+      await writeTeam(stateRoot, fresh)
+      return members
+    })
+    await recordRetiredMemberIds(stateRoot, roster.map(member => member.id))
+    const current = await requireFreshTeam(stateRoot, teamId)
+    await stopTeamMemberActivations(ctx, await memberOperationParent(ctx, current, captain), roster, signal)
+    await withTeamLock(teamLockKey(stateRoot, teamId), async () => {
+      const fresh = await requireFreshCaptainTeam(ctx, stateRoot, teamId, captain.id)
+      appendTeamEvent(ctx, captainSessionOf(ctx, fresh.captainSessionId, captain.session), 'agent-teams/team-deleted', {
+        teamId: fresh.id,
+      })
+      // Archive, not delete: tasks (with their dependency graph) and the
+      // mailboxes stay on disk for later review and dependency rebuilds.
+      await archiveTeamDir(stateRoot, fresh.id)
+    })
+    return { deleted: true, team_name: current.name }
+  }
 
   ctx.tools.register(defineTool({
     name: 'agent_teams_create',
@@ -2525,36 +2564,8 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
     async execute(_args, exec) {
       const captain = requireCaptain(exec)
       const workspace = workspaceOf(captain)
-      const stateRoot = stateRootOf(workspace, config)
       const team = await requireCaptainTeam(ctx, workspace, config, captain)
-      const members = await withTeamLock(teamLockKey(stateRoot, team.id), async () => {
-        const fresh = await requireFreshCaptainTeam(ctx, stateRoot, team.id, captain.id)
-        // Include previously removed members so deleting a pre-fix team also
-        // retires durable catalog entries left behind by remove_member.
-        const roster = fresh.members.map(member => ({ ...member }))
-        for (const member of fresh.members) {
-          await discardMailboxMessages(stateRoot, fresh.id, member.name, (await readUnreadMailbox(stateRoot, fresh.id, member.name)).map(message => message.id))
-          if (member.status === 'removed') continue
-          member.status = 'removed'
-          for (const task of fresh.tasks) {
-            if (task.assignee === member.name && !TERMINAL_TASK_STATUSES.includes(task.status)) invalidateTaskAttempt(task)
-          }
-        }
-        await writeTeam(stateRoot, fresh)
-        return roster
-      })
-      await recordRetiredMemberIds(stateRoot, members.map(member => member.id))
-      await stopTeamMemberActivations(ctx, await memberOperationParent(ctx, team, captain), members, exec.signal)
-      await withTeamLock(teamLockKey(stateRoot, team.id), async () => {
-        const fresh = await requireFreshCaptainTeam(ctx, stateRoot, team.id, captain.id)
-        appendTeamEvent(ctx, captainSessionOf(ctx, fresh.captainSessionId, captain.session), 'agent-teams/team-deleted', {
-          teamId: fresh.id,
-        })
-        // Archive, not delete: tasks (with their dependency graph) and the
-        // mailboxes stay on disk for later review and dependency rebuilds.
-        await archiveTeamDir(stateRoot, fresh.id)
-      })
-      return { deleted: true, team_name: team.name }
+      return await deleteTeam(captain, team.id, exec.signal)
     },
   }))
   // Live-member hydration validates saved filters against registered tools.
@@ -2569,6 +2580,7 @@ export function registerAgentTeamsTools(ctx: Context, config: ToolsConfig): Agen
     approveStagedTeam,
     continueStagedPlanning,
     discardStagedTeam,
+    deleteTeam,
   }
 
   return runtime

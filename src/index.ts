@@ -34,7 +34,7 @@ import {
   type ToolsConfig,
 } from './tools.ts'
 import { installAgentTeamsGestureBoundary, registerAgentTeamsCommand } from './command.ts'
-import { readFile } from 'node:fs/promises'
+import { readFile, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { collectArchivedTeamsActivity, collectTeamsActivity } from './snapshot.ts'
@@ -282,6 +282,59 @@ export function apply(ctx: Context, config: Config): void {
     },
   }), 'agent-teams: activity route')
 
+    // Permanently remove an already-archived team. Historic teams have no live
+    // captain, so the archive-only delete_team path cannot reach them; this
+    // finds the team's archive directory across every workspace state root and
+    // deletes it. Protected by the same authenticated web-route wrapper.
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/plugins/dsh-agent-teams/purge-archived',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        let payload: Record<string, unknown>
+        try {
+          payload = await readJsonRequest(req)
+        } catch (error: unknown) {
+          res.writeHead(error instanceof RequestBodyError ? error.status : 400, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'invalid request body' }))
+          return
+        }
+        const teamId = typeof payload['teamId'] === 'string' ? payload['teamId'].trim() : ''
+        if (teamId === '' || teamId.includes('/') || teamId.includes('\\') || teamId.includes('..')) {
+          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: 'a valid teamId is required' }))
+          return
+        }
+        try {
+          let removed = false
+          for (const workspace of workspaceRegistry.list()) {
+            const stateRoot = join(workspace.path, resolved.stateDir)
+            const archiveDir = join(stateRoot, 'archive', teamId)
+            let isDir = false
+            try {
+              isDir = (await stat(archiveDir)).isDirectory()
+            } catch {
+              isDir = false
+            }
+            if (!isDir) continue
+            await rm(archiveDir, { recursive: true, force: true })
+            removed = true
+            break
+          }
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ ok: true, removed }))
+        } catch (error: unknown) {
+          ctx.logger.warn(`agent-teams: purge failed for ${teamId}: ${String(error)}`)
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify({ error: 'failed to delete the archived team' }))
+        }
+      },
+    }), 'agent-teams: purge-archived route')
+
     ctx.effect(() => webServer.register({
       kind: 'exact',
       path: '/plugins/dsh-agent-teams/halt',
@@ -406,6 +459,13 @@ export function apply(ctx: Context, config: Config): void {
             const discarded = await agentTeamsRuntime.discardStagedTeam(captain, teamId)
             res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
             res.end(JSON.stringify({ ok: true, phase: 'archived', ...discarded }))
+            return
+          }
+          if (action === 'delete_team') {
+            // Same archive-not-delete path as the agent_teams_delete tool.
+            const deleted = await agentTeamsRuntime.deleteTeam(captain, teamId)
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(JSON.stringify({ ok: true, phase: 'archived', ...deleted }))
             return
           }
           const dependencies = Array.isArray(payload['dependencies'])

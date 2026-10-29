@@ -85,6 +85,10 @@ export interface AgentTeamsRuntime {
     discardStagedTeam(captain: Agent, teamId: string): Promise<{
         teamId: string;
     }>;
+    deleteTeam(captain: Agent, teamId: string, signal?: AbortSignal): Promise<{
+        deleted: true;
+        team_name: string;
+    }>;
 }
 export declare function haltTeamWork(input: {
     ctx: Context;
